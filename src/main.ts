@@ -166,6 +166,17 @@ export default class FrontmatterModified extends Plugin {
             if (!this.settings.onlyUpdateExisting && this.settings.createdDateProperty && !frontmatter[this.settings.createdDateProperty]) {
               frontmatter[this.settings.createdDateProperty] = this.formatFrontmatterDate(moment(file.stat.ctime || now))
             }
+
+            if (this.settings.createdDateProperty && frontmatter[this.settings.createdDateProperty]) {
+              const createdDate = moment(frontmatter[this.settings.createdDateProperty], this.settings.momentFormat);
+              const tag = createdDate.format('YYYY/MM/DD');
+              if (!frontmatter.tags) {
+                frontmatter.tags = [];
+              }
+              if (!frontmatter.tags.includes(tag)) {
+                frontmatter.tags.push(tag);
+              }
+            }
           })
         }
       }
