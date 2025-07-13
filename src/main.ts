@@ -1,5 +1,13 @@
-import { Plugin, TFile, moment } from 'obsidian'
+import { Plugin, TFile, moment, Notice } from 'obsidian'
 import { DEFAULT_SETTINGS, FrontmatterModifiedSettings, FrontmatterModifiedSettingTab } from './settings'
+import { utimes, access, constants } from 'fs'
+import { promisify } from 'util'
+import { join, normalize } from 'path'
+import { exec } from 'child_process'
+
+const utimesAsync = promisify(utimes)
+const accessAsync = promisify(access)
+const execAsync = promisify(exec)
 
 export default class FrontmatterModified extends Plugin {
   settings: FrontmatterModifiedSettings
@@ -58,6 +66,15 @@ export default class FrontmatterModified extends Plugin {
     }
 
     this.addSettingTab(new FrontmatterModifiedSettingTab(this.app, this))
+
+    // Add command to update OS timestamps for entire vault
+    this.addCommand({
+      id: 'update-all-os-timestamps',
+      name: 'Update OS timestamps for all vault notes',
+      callback: () => {
+        this.updateAllOSTimestamps()
+      }
+    })
   }
 
   /**
@@ -176,6 +193,9 @@ export default class FrontmatterModified extends Plugin {
               if (!frontmatter.tags.includes(tag)) {
                 frontmatter.tags.push(tag);
               }
+
+              // Update OS file timestamp if enabled and created date is valid
+              this.updateOSFileTimestamp(file, createdDate);
             }
           })
         }
@@ -196,5 +216,328 @@ export default class FrontmatterModified extends Plugin {
     } else {
       return output
     }
+  }
+
+  /**
+   * Update the OS file creation timestamp to match the created date from frontmatter
+   * @param {TFile} file - The file to update
+   * @param {moment.Moment} createdDate - The created date from frontmatter
+   */
+  async updateOSFileTimestamp (file: TFile, createdDate: moment.Moment) {
+    // Only proceed if created date is valid and we have a created date property configured
+    if (!this.settings.createdDateProperty || !createdDate.isValid()) {
+      return
+    }
+
+    // Get the full file path by accessing the vault adapter
+    const adapter = this.app.vault.adapter as any
+    let filePath: string = 'unknown'
+
+    try {
+      // Try different methods to get the base path
+      if (adapter.basePath) {
+        // Most common case - FileSystemAdapter has basePath
+        filePath = normalize(join(adapter.basePath, file.path))
+      } else if (adapter.path?.basePath) {
+        // Alternative path structure
+        filePath = normalize(join(adapter.path.basePath, file.path))
+      } else {
+        // Last resort: try to parse from resource path
+        const resourcePath = this.app.vault.getResourcePath(file)
+        if (resourcePath.startsWith('file://')) {
+          filePath = decodeURIComponent(resourcePath.slice(7))
+        } else {
+          filePath = resourcePath
+        }
+        filePath = normalize(filePath)
+      }
+
+      // Check if file exists before attempting to update timestamp
+      await accessAsync(filePath, constants.F_OK)
+
+      // Get current file stats for comparison
+      const currentCreatedTime = file.stat.ctime
+      const currentModifiedTime = file.stat.mtime
+      const newCreatedTimestamp = createdDate.toDate().getTime()
+
+      // Calculate time difference in hours
+      const timeDifferenceMs = Math.abs(newCreatedTimestamp - currentCreatedTime)
+      const timeDifferenceHours = timeDifferenceMs / (1000 * 60 * 60)
+
+      // Skip update if time difference is less than 12 hours
+      if (timeDifferenceHours < 12) {
+        new Notice(
+          `⏭️ Skipped OS timestamp update for "${file.name}"\n` +
+          `⏰ Time difference: ${Math.round(timeDifferenceHours * 100) / 100} hours\n` +
+          `📏 Threshold: 12 hours minimum\n` +
+          `💾 Full path: ${filePath}`,
+          4000
+        )
+        console.log(`Skipped OS timestamp update for ${file.path}: time difference ${timeDifferenceHours.toFixed(2)} hours < 12 hours threshold`)
+        return
+      }
+
+      // Update file creation timestamp using platform-specific method
+      await this.updateFileCreationTime(filePath, createdDate)
+
+      // Also update access time to match creation time, keep modification time unchanged
+      const createdTimestampSeconds = newCreatedTimestamp / 1000
+      const currentModifiedTimeSeconds = currentModifiedTime / 1000
+      await utimesAsync(filePath, createdTimestampSeconds, currentModifiedTimeSeconds)
+
+      // Create detailed notification message using already calculated time difference
+      const daysDifference = Math.floor(timeDifferenceHours / 24)
+      const remainingHours = Math.floor(timeDifferenceHours % 24)
+      const minutesDifference = Math.floor((timeDifferenceHours % 1) * 60)
+
+      let timeDiffText = ''
+      if (daysDifference > 0) {
+        timeDiffText = `${daysDifference}d ${remainingHours}h ${minutesDifference}m`
+      } else if (remainingHours > 0) {
+        timeDiffText = `${remainingHours}h ${minutesDifference}m`
+      } else if (minutesDifference > 0) {
+        timeDiffText = `${minutesDifference}m`
+      } else {
+        timeDiffText = 'less than 1m'
+      }
+
+      const direction = newCreatedTimestamp < currentCreatedTime ? 'earlier' : 'later'
+      const formattedDate = createdDate.format('YYYY-MM-DD HH:mm:ss')
+
+      // Show detailed success notification with full path
+      new Notice(
+        `✅ OS timestamp updated for "${file.name}"\n` +
+        `📅 New creation time: ${formattedDate}\n` +
+        `⏰ Adjusted ${timeDiffText} ${direction} than original\n` +
+        `📁 Vault path: ${file.path}\n` +
+        `💾 Full path: ${filePath}`,
+        7000
+      )
+
+      console.log(`Successfully updated OS file timestamp for ${file.path} to ${formattedDate}`)
+    } catch (error) {
+      // Show detailed error notification with full path
+      const errorMessage = error instanceof Error ? error.message : String(error)
+      new Notice(
+        `❌ Failed to update OS timestamp for "${file.name}"\n` +
+        `🚫 Error: ${errorMessage}\n` +
+        `📁 Vault path: ${file.path}\n` +
+        `💾 Full path: ${filePath}\n` +
+        `💡 Check file permissions and path validity`,
+        9000
+      )
+      console.error(`Failed to update OS file timestamp for ${file.path}:`, error)
+    }
+  }
+
+  /**
+   * Update OS file timestamp silently (for batch operations)
+   * @param {TFile} file - The file to update
+   * @param {moment.Moment} createdDate - The created date from frontmatter
+   * @returns {Promise<string>} - 'updated', 'skipped_threshold', or throws error
+   */
+  async updateOSFileTimestampSilent(file: TFile, createdDate: moment.Moment): Promise<string> {
+    // Only proceed if created date is valid and we have a created date property configured
+    if (!this.settings.createdDateProperty || !createdDate.isValid()) {
+      throw new Error('Invalid configuration or date')
+    }
+
+    // Get the full file path by accessing the vault adapter
+    const adapter = this.app.vault.adapter as any
+    let filePath: string = 'unknown'
+
+    // Try different methods to get the base path
+    if (adapter.basePath) {
+      // Most common case - FileSystemAdapter has basePath
+      filePath = normalize(join(adapter.basePath, file.path))
+    } else if (adapter.path?.basePath) {
+      // Alternative path structure
+      filePath = normalize(join(adapter.path.basePath, file.path))
+    } else {
+      // Last resort: try to parse from resource path
+      const resourcePath = this.app.vault.getResourcePath(file)
+      if (resourcePath.startsWith('file://')) {
+        filePath = decodeURIComponent(resourcePath.slice(7))
+      } else {
+        filePath = resourcePath
+      }
+      filePath = normalize(filePath)
+    }
+
+    // Check if file exists before attempting to update timestamp
+    await accessAsync(filePath, constants.F_OK)
+
+    // Get current file stats for comparison
+    const currentCreatedTime = file.stat.ctime
+    const currentModifiedTime = file.stat.mtime
+    const newCreatedTimestamp = createdDate.toDate().getTime()
+
+    // Calculate time difference in hours
+    const timeDifferenceMs = Math.abs(newCreatedTimestamp - currentCreatedTime)
+    const timeDifferenceHours = timeDifferenceMs / (1000 * 60 * 60)
+
+    // Skip update if time difference is less than 12 hours
+    if (timeDifferenceHours < 12) {
+      return 'skipped_threshold'
+    }
+
+    // Update file creation timestamp using platform-specific method
+    await this.updateFileCreationTime(filePath, createdDate)
+
+    // Also update access time to match creation time, keep modification time unchanged
+    const createdTimestampSeconds = newCreatedTimestamp / 1000
+    const currentModifiedTimeSeconds = currentModifiedTime / 1000
+    await utimesAsync(filePath, createdTimestampSeconds, currentModifiedTimeSeconds)
+
+    return 'updated'
+  }
+
+  /**
+   * Update file creation time using platform-specific methods
+   * @param {string} filePath - The full file system path
+   * @param {moment.Moment} createdDate - The target creation date
+   */
+  async updateFileCreationTime(filePath: string, createdDate: moment.Moment) {
+    // Detect platform and use appropriate command
+    const platform = process.platform
+
+    if (platform === 'win32') {
+      // Windows: Use PowerShell to update creation time
+      // Escape the file path and use proper PowerShell syntax
+      const escapedPath = filePath.replace(/'/g, "''")
+      const dateString = createdDate.format('YYYY-MM-DD HH:mm:ss')
+
+      // Use PowerShell with proper escaping and explicit DateTime constructor
+      try {
+        // Create a simpler, more reliable PowerShell command
+        const powershellScript = `try { $file = Get-Item -LiteralPath '${escapedPath}' -ErrorAction Stop; $newDate = [DateTime]::ParseExact('${dateString}', 'yyyy-MM-dd HH:mm:ss', $null); $file.CreationTime = $newDate; Write-Output 'Success: Updated creation time' } catch { Write-Error $_.Exception.Message; exit 1 }`
+
+        await execAsync(`powershell -Command "${powershellScript}"`)
+      } catch (psError) {
+        // If PowerShell fails, provide detailed error information
+        console.log('PowerShell method failed, no fallback available for Windows creation time update')
+        throw new Error(`PowerShell failed: ${psError.message}. File path: ${filePath}. Target date: ${dateString}`)
+      }
+    } else if (platform === 'darwin') {
+      // macOS: Use SetFile command if available, otherwise touch
+      try {
+        const timestamp = createdDate.format('MM/DD/YYYY HH:mm:ss')
+        await execAsync(`SetFile -d "${timestamp}" "${filePath}"`)
+      } catch {
+        // Fallback to touch if SetFile is not available
+        const touchTimestamp = createdDate.format('YYYYMMDDHHmm.ss')
+        await execAsync(`touch -t ${touchTimestamp} "${filePath}"`)
+      }
+    } else {
+      // Linux/Unix: Use touch command (note: this updates modification time, not creation time)
+      const touchTimestamp = createdDate.format('YYYYMMDDHHmm.ss')
+      await execAsync(`touch -t ${touchTimestamp} "${filePath}"`)
+    }
+  }
+
+  /**
+   * Update OS timestamps for all notes in the vault that have created dates
+   */
+  async updateAllOSTimestamps() {
+    // Only proceed if created date property is configured
+    if (!this.settings.createdDateProperty) {
+      new Notice(
+        `❌ Cannot update OS timestamps\n` +
+        `⚙️ No created date property configured\n` +
+        `💡 Please set a created date property in plugin settings first`,
+        6000
+      )
+      return
+    }
+
+    // Get all markdown files in the vault
+    const allFiles = this.app.vault.getMarkdownFiles()
+
+    // Show initial notification
+    new Notice(
+      `🔄 Starting OS timestamp update for entire vault\n` +
+      `📁 Found ${allFiles.length} markdown files\n` +
+      `⏳ This may take a while...`,
+      4000
+    )
+
+    let processedCount = 0
+    let updatedCount = 0
+    let skippedThresholdCount = 0
+    let errorCount = 0
+    const errors: string[] = []
+
+    // Process files in batches to avoid overwhelming the system
+    const batchSize = 10
+    for (let i = 0; i < allFiles.length; i += batchSize) {
+      const batch = allFiles.slice(i, i + batchSize)
+
+      // Process batch concurrently
+      await Promise.allSettled(
+        batch.map(async (file) => {
+          try {
+            processedCount++
+
+            // Get file cache to check for created date
+            const cache = this.app.metadataCache.getFileCache(file)
+            const createdDateValue = cache?.frontmatter?.[this.settings.createdDateProperty]
+
+            if (createdDateValue) {
+              const createdDate = moment(createdDateValue, this.settings.momentFormat)
+              if (createdDate.isValid()) {
+                const result = await this.updateOSFileTimestampSilent(file, createdDate)
+                if (result === 'updated') {
+                  updatedCount++
+                } else if (result === 'skipped_threshold') {
+                  skippedThresholdCount++
+                }
+              } else {
+                errors.push(`${file.path}: Invalid date format`)
+                errorCount++
+              }
+            }
+            // Skip files without created date (not counted as errors)
+          } catch (error) {
+            errorCount++
+            const errorMsg = error instanceof Error ? error.message : String(error)
+            errors.push(`${file.path}: ${errorMsg}`)
+          }
+        })
+      )
+
+      // Show progress notification every few batches
+      if (i % (batchSize * 3) === 0 && i > 0) {
+        new Notice(
+          `⏳ Progress: ${processedCount}/${allFiles.length} files processed\n` +
+          `✅ Updated: ${updatedCount} files\n` +
+          `❌ Errors: ${errorCount} files`,
+          2000
+        )
+      }
+    }
+
+    // Show final summary notification
+    const successRate = allFiles.length > 0 ? Math.round((updatedCount / allFiles.length) * 100) : 0
+
+    new Notice(
+      `🎉 Vault OS timestamp update completed!\n` +
+      `📊 Total files: ${allFiles.length}\n` +
+      `✅ Successfully updated: ${updatedCount}\n` +
+      `⏭️ Skipped (no created date): ${processedCount - updatedCount - skippedThresholdCount - errorCount}\n` +
+      `⏰ Skipped (< 12h difference): ${skippedThresholdCount}\n` +
+      `❌ Errors: ${errorCount}\n` +
+      `📈 Success rate: ${successRate}%` +
+      (errorCount > 0 ? `\n💡 Check console for error details` : ''),
+      8000
+    )
+
+    // Log detailed errors to console if any
+    if (errors.length > 0) {
+      console.group('OS Timestamp Update Errors:')
+      errors.forEach(error => console.error(error))
+      console.groupEnd()
+    }
+
+    console.log(`Vault OS timestamp update completed: ${updatedCount}/${allFiles.length} files updated successfully`)
   }
 }
